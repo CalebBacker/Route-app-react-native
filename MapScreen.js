@@ -17,7 +17,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // Storage key
 const ROUTES_STORAGE_KEY = 'saved_routes';
 // Google API Key
-const GOOGLE_API_KEY = 'AIzaSyDc-ESEi6f0JZwOGXdOy_NVeVH1kfpS1UI';
+const GOOGLE_API_KEY = 'API KEY';
 
 function MapScreen({ navigation, route, loadRoutes }) {
   const [originQuery, setOriginQuery] = useState('');
