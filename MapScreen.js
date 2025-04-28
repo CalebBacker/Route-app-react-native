@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
-  Button,
+  TouchableOpacity,
   Alert,
   TextInput,
   StyleSheet,
   SafeAreaView,
   useWindowDimensions,
-  Switch
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform
 } from 'react-native';
 import MapView, { Marker, Polyline, Callout } from 'react-native-maps';
 import polyline from '@mapbox/polyline';
@@ -17,7 +19,20 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // Storage key
 const ROUTES_STORAGE_KEY = 'saved_routes';
 // Google API Key
-const GOOGLE_API_KEY = 'API KEY';
+const GOOGLE_API_KEY = 'AIzaSyDc-ESEi6f0JZwOGXdOy_NVeVH1kfpS1UI';
+
+// Define place types we're interested in with more specific types
+const PLACE_TYPES = [
+  'gas_station', 
+  'restaurant', 
+  'rest_area', 
+  'lodging',
+  'parking',
+  'convenience_store', 
+  'cafe',
+  'tourist_attraction',
+  'campground'
+].join('|');
 
 function MapScreen({ navigation, route, loadRoutes }) {
   const [originQuery, setOriginQuery] = useState('');
@@ -28,75 +43,22 @@ function MapScreen({ navigation, route, loadRoutes }) {
   const [isLoadingRestStops, setIsLoadingRestStops] = useState(false);
   const { width, height } = useWindowDimensions();
   const mapRef = useRef(null);
-
-  // Find rest stops along the route - defined with useCallback
-  const findRestStops = useCallback(async () => {
-    if (routeCoords.length === 0) {
-      Alert.alert('Error', 'Please generate a route first');
-      setShowRestStops(false);
-      return;
-    }
-
-    setIsLoadingRestStops(true);
-    try {
-      // We'll use several points along the route to search for rest stops
-      const numPoints = Math.min(5, routeCoords.length);
-      const step = Math.floor(routeCoords.length / numPoints);
-      const searchPoints = [];
-      
-      for (let i = 0; i < numPoints; i++) {
-        searchPoints.push(routeCoords[i * step]);
+  
+  // Add refs to manage API requests and component mounting state
+  const isMountedRef = useRef(true);
+  const abortControllerRef = useRef(null);
+  
+  // Clean up on component unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    
+    return () => {
+      isMountedRef.current = false;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
-      
-      // Add destination point
-      if (routeCoords.length > 0) {
-        searchPoints.push(routeCoords[routeCoords.length - 1]);
-      }
-
-      // Set of unique place IDs to avoid duplicates
-      const uniquePlaceIds = new Set();
-      let allRestStops = [];
-
-      // Search for rest stops near each point
-      for (const point of searchPoints) {
-        const { latitude, longitude } = point;
-        const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${latitude},${longitude}&radius=16093&type=gas_station|restaurant|rest_area&key=${GOOGLE_API_KEY}`;
-        
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        if (data.status === 'OK' && data.results) {
-          // Filter for unique places
-          const newRestStops = data.results
-            .filter(place => !uniquePlaceIds.has(place.place_id))
-            .map(place => {
-              uniquePlaceIds.add(place.place_id);
-              return {
-                id: place.place_id,
-                name: place.name,
-                location: {
-                  latitude: place.geometry.location.lat,
-                  longitude: place.geometry.location.lng
-                },
-                address: place.vicinity,
-                types: place.types,
-                rating: place.rating
-              };
-            });
-          
-          allRestStops = [...allRestStops, ...newRestStops];
-        }
-      }
-
-      setRestStops(allRestStops);
-    } catch (error) {
-      console.error('Error finding rest stops:', error);
-      Alert.alert('Error', 'Failed to find rest stops');
-      setShowRestStops(false);
-    } finally {
-      setIsLoadingRestStops(false);
-    }
-  }, [routeCoords]);
+    };
+  }, []);
 
   // Handle route selection from RoutesScreen
   useEffect(() => {
@@ -118,14 +80,186 @@ function MapScreen({ navigation, route, loadRoutes }) {
     }
   }, [route.params?.selectedRoute, navigation]);
 
-  // Find rest stops when showRestStops is toggled or route changes
-  useEffect(() => {
-    if (showRestStops && routeCoords.length > 0) {
-      findRestStops();
-    } else {
-      setRestStops([]);
+  // Function to fetch rest stops data safely
+  const fetchRestStops = async () => {
+    if (routeCoords.length === 0) {
+      Alert.alert('Error', 'Please generate a route first');
+      setShowRestStops(false);
+      return;
     }
-  }, [showRestStops, routeCoords, findRestStops]);
+    
+    // Cancel any existing requests
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
+    // Create a new abort controller
+    abortControllerRef.current = new AbortController();
+    
+    setIsLoadingRestStops(true);
+    
+    try {
+      // Use five points along the route for better coverage
+      const numPoints = Math.min(5, routeCoords.length);
+      const pointIndices = [];
+      
+      // Calculate evenly spaced indices along the route
+      for (let i = 0; i < numPoints; i++) {
+        const index = Math.floor(i * (routeCoords.length - 1) / (numPoints - 1));
+        pointIndices.push(index);
+      }
+      
+      const searchPoints = pointIndices.map(index => routeCoords[index]);
+      
+      let allRestStops = [];
+      const uniquePlaceIds = new Set();
+      
+      // Use custom keywords for better rest area detection
+      const keywords = [
+        'rest area', 
+        'rest stop', 
+        'truck stop',
+        'travel plaza',
+        'service area',
+        'welcome center'
+      ];
+      
+      // Make API calls for each search point
+      const searchPromises = [];
+      
+      // First search for place types
+      for (const point of searchPoints) {
+        const { latitude, longitude } = point;
+        const typePromise = fetch(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${latitude},${longitude}&radius=10000&type=${PLACE_TYPES}&key=${GOOGLE_API_KEY}`, { 
+          signal: abortControllerRef.current.signal 
+        })
+        .then(response => {
+          if (!response.ok) {
+            console.warn('Failed to get response from Places API:', response.status);
+            return [];
+          }
+          return response.json();
+        })
+        .then(data => {
+          if (data.status === 'OK' && data.results) {
+            return data.results;
+          }
+          return [];
+        })
+        .catch(error => {
+          if (error.name === 'AbortError') {
+            console.log('Request was aborted');
+          } else {
+            console.error('Error searching for places by type:', error);
+          }
+          return [];
+        });
+        
+        searchPromises.push(typePromise);
+      }
+      
+      // Then search using keywords for rest areas
+      for (const keyword of keywords) {
+        for (const point of searchPoints) {
+          const { latitude, longitude } = point;
+          const keywordPromise = fetch(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${latitude},${longitude}&radius=20000&keyword=${encodeURIComponent(keyword)}&key=${GOOGLE_API_KEY}`, { 
+            signal: abortControllerRef.current.signal 
+          })
+          .then(response => {
+            if (!response.ok) {
+              return [];
+            }
+            return response.json();
+          })
+          .then(data => {
+            if (data.status === 'OK' && data.results) {
+              return data.results;
+            }
+            return [];
+          })
+          .catch(error => {
+            if (error.name !== 'AbortError') {
+              console.error('Error searching for places by keyword:', error);
+            }
+            return [];
+          });
+          
+          searchPromises.push(keywordPromise);
+        }
+      }
+      
+      // Wait for all promises to resolve
+      const results = await Promise.all(searchPromises);
+      
+      // Combine and deduplicate results
+      for (const places of results) {
+        for (const place of places) {
+          if (!uniquePlaceIds.has(place.place_id)) {
+            uniquePlaceIds.add(place.place_id);
+            
+            // For debugging
+            console.log(`Found place: ${place.name}, types:`, place.types ? place.types.join(',') : 'none');
+            
+            allRestStops.push({
+              id: place.place_id,
+              name: place.name,
+              location: {
+                latitude: place.geometry.location.lat,
+                longitude: place.geometry.location.lng
+              },
+              address: place.vicinity,
+              types: Array.isArray(place.types) ? place.types : [],
+              rating: place.rating
+            });
+          }
+        }
+      }
+      
+      // Check if component is still mounted before updating state
+      if (isMountedRef.current) {
+        setRestStops(allRestStops);
+        console.log(`Found ${allRestStops.length} rest stops`);
+      }
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        console.error('Error fetching rest stops:', error);
+        // Only alert if still mounted
+        if (isMountedRef.current) {
+          Alert.alert('Error', 'Failed to find rest stops');
+        }
+      }
+    } finally {
+      // Make sure we only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoadingRestStops(false);
+      }
+    }
+  };
+
+  // Handle the toggle press safely
+  const toggleRestStops = () => {
+    const newValue = !showRestStops;
+    
+    // Update the UI state immediately
+    setShowRestStops(newValue);
+    
+    // If turning off, abort any ongoing fetch and clear data
+    if (!newValue) {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      setIsLoadingRestStops(false);
+      // Don't clear restStops immediately to avoid UI flicker
+      return;
+    }
+    
+    // If turning on, fetch rest stops data
+    if (newValue && routeCoords.length > 0) {
+      // Clear previous rest stops before starting new fetch
+      setRestStops([]);
+      fetchRestStops();
+    }
+  };
 
   // Get route from Google Maps API
   const getRoute = async () => {
@@ -239,120 +373,244 @@ function MapScreen({ navigation, route, loadRoutes }) {
     );
   };
 
-  // Test AsyncStorage functionality
-  const testStorage = async () => {
-    try {
-      await AsyncStorage.setItem('test_key', 'test_value');
-      const value = await AsyncStorage.getItem('test_key');
-      Alert.alert('Storage Test', value === 'test_value' ? 'Success!' : 'Failed');
-    } catch (error) {
-      Alert.alert('Storage Test Failed', error.message);
+  // Improved marker color detection
+  const getMarkerColor = (types = [], name = '') => {
+    if (!Array.isArray(types)) {
+      types = [];
     }
+    
+    // Convert everything to lowercase for case-insensitive matching
+    const typeStr = types.join(' ').toLowerCase();
+    const nameStr = (name || '').toLowerCase();
+    
+    // Check for rest areas first in both name and types
+    if (
+      typeStr.includes('rest_area') || 
+      nameStr.includes('rest area') || 
+      nameStr.includes('rest stop') ||
+      nameStr.includes('service area') ||
+      nameStr.includes('travel plaza') ||
+      nameStr.includes('welcome center')
+    ) {
+      return 'blue';
+    }
+    
+    // Then check other types
+    if (typeStr.includes('gas_station') || typeStr.includes('gas station')) {
+      return 'green';
+    }
+    
+    if (typeStr.includes('restaurant') || typeStr.includes('food') || typeStr.includes('cafe')) {
+      return 'orange';
+    }
+    
+    if (typeStr.includes('lodging') || typeStr.includes('hotel') || typeStr.includes('motel')) {
+      return 'purple';
+    }
+    
+    if (typeStr.includes('convenience') || typeStr.includes('store')) {
+      return 'yellow';
+    }
+    
+    // Default color for anything else
+    return 'red';
   };
 
-  // Get marker icon based on place type
-  const getMarkerColor = (types) => {
-    if (types.includes('gas_station')) return 'green';
-    if (types.includes('restaurant')) return 'orange';
-    if (types.includes('rest_area')) return 'blue';
-    return 'red'; // default
+  // Format the place type for display - more user-friendly
+  const formatPlaceType = (types = [], name = '') => {
+    if (!Array.isArray(types) || types.length === 0) {
+      // Try to infer type from name
+      const nameStr = (name || '').toLowerCase();
+      if (nameStr.includes('rest area') || nameStr.includes('rest stop')) {
+        return 'Rest Area';
+      }
+      if (nameStr.includes('gas')) {
+        return 'Gas Station';
+      }
+      return 'Location';
+    }
+    
+    // Check for common types
+    if (types.includes('rest_area')) return 'Rest Area';
+    if (types.includes('gas_station')) return 'Gas Station';
+    if (types.includes('restaurant')) return 'Restaurant';
+    if (types.includes('cafe')) return 'Cafe';
+    if (types.includes('lodging')) return 'Lodging';
+    if (types.includes('convenience_store')) return 'Convenience Store';
+    
+    // Get the primary type
+    const primaryType = types[0]?.replace(/_/g, ' ');
+    return primaryType ? primaryType.charAt(0).toUpperCase() + primaryType.slice(1) : 'Location';
   };
+
+  // Calculate map height (60% of screen height)
+  const mapHeight = height * 0.6;
+  
+  // Calculate 1cm in pixels (approximately 38 pixels)
+  const oneCmInPixels = 38;
 
   return (
     <SafeAreaView style={styles.container}>
-      <MapView
-        ref={mapRef}
-        style={{ width, height: height * 0.5 }}
-        initialRegion={{
-          latitude: 37.7749,
-          longitude: -122.4194,
-          latitudeDelta: 0.1,
-          longitudeDelta: 0.1
-        }}
+      <KeyboardAvoidingView 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        style={styles.keyboardAvoid}
       >
-        {routeCoords.length > 0 && (
-          <>
-            <Polyline coordinates={routeCoords} strokeWidth={4} strokeColor="#2196F3" />
-            <Marker 
-              coordinate={routeCoords[0]} 
-              title="Origin"
-              pinColor="green"
-            />
-            <Marker 
-              coordinate={routeCoords[routeCoords.length - 1]} 
-              title="Destination"
-              pinColor="red"
-            />
-          </>
-        )}
+        <View style={styles.contentContainer}>
+          {/* Fixed size map */}
+          <View style={styles.mapContainer}>
+            <MapView
+              ref={mapRef}
+              style={[styles.map, { height: mapHeight }]}
+              initialRegion={{
+                latitude: 37.7749,
+                longitude: -122.4194,
+                latitudeDelta: 0.1,
+                longitudeDelta: 0.1
+              }}
+            >
+              {routeCoords.length > 0 && (
+                <>
+                  <Polyline coordinates={routeCoords} strokeWidth={4} strokeColor="#2196F3" />
+                  <Marker 
+                    coordinate={routeCoords[0]} 
+                    title="Origin"
+                    pinColor="green"
+                  />
+                  <Marker 
+                    coordinate={routeCoords[routeCoords.length - 1]} 
+                    title="Destination"
+                    pinColor="red"
+                  />
+                </>
+              )}
 
-        {showRestStops && restStops.map(stop => (
-          <Marker
-            key={stop.id}
-            coordinate={stop.location}
-            title={stop.name}
-            pinColor={getMarkerColor(stop.types)}
-          >
-            <Callout>
-              <View style={styles.callout}>
-                <Text style={styles.calloutTitle}>{stop.name}</Text>
-                <Text>{stop.address}</Text>
-                {stop.rating && <Text>Rating: {stop.rating} ⭐</Text>}
+              {/* Only render markers when showRestStops is true */}
+              {showRestStops && restStops.map(stop => (
+                <Marker
+                  key={stop.id}
+                  coordinate={stop.location}
+                  title={stop.name}
+                  pinColor={getMarkerColor(stop.types, stop.name)}
+                >
+                  <Callout>
+                    <View style={styles.callout}>
+                      <Text style={styles.calloutTitle}>{stop.name}</Text>
+                      <Text>{stop.address}</Text>
+                      {stop.rating && <Text>Rating: {stop.rating} ⭐</Text>}
+                      <Text style={styles.calloutType}>{formatPlaceType(stop.types, stop.name)}</Text>
+                    </View>
+                  </Callout>
+                </Marker>
+              ))}
+            </MapView>
+          </View>
+          
+          {/* Controls below the map - moved down by 1cm */}
+          <View style={[styles.controlsContainer, { top: `calc(60% + ${oneCmInPixels}px)` }]}>
+            {/* Card with all controls - positioned at bottom of map */}
+            <View style={styles.card}>
+              {/* Row with input fields */}
+              <View style={styles.row}>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Origin"
+                  value={originQuery}
+                  onChangeText={setOriginQuery}
+                  placeholderTextColor="#888"
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Destination"
+                  value={destinationQuery}
+                  onChangeText={setDestinationQuery}
+                  placeholderTextColor="#888"
+                />
               </View>
-            </Callout>
-          </Marker>
-        ))}
-      </MapView>
-
-      <View style={styles.controls}>
-        <TextInput
-          style={styles.input}
-          placeholder="Origin"
-          value={originQuery}
-          onChangeText={setOriginQuery}
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Destination"
-          value={destinationQuery}
-          onChangeText={setDestinationQuery}
-        />
-        <Button title="Get Route" onPress={getRoute} />
-      </View>
-
-      <View style={styles.toggleContainer}>
-        <Text>Show Rest Stops</Text>
-        <Switch
-          value={showRestStops}
-          onValueChange={setShowRestStops}
-          disabled={routeCoords.length === 0 || isLoadingRestStops}
-        />
-        {isLoadingRestStops && <Text style={styles.loading}>Loading...</Text>}
-      </View>
-
-      <View style={styles.buttonRow}>
-        <Button title="Save Route" onPress={saveRoute} />
-        <Button title="View Saved Routes" onPress={() => navigation.navigate('Routes')} />
-        <Button title="Test Storage" onPress={testStorage} />
-      </View>
-
-      {showRestStops && restStops.length > 0 && (
-        <View style={styles.legend}>
-          <Text style={styles.legendTitle}>Legend:</Text>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, {backgroundColor: 'green'}]} />
-            <Text>Gas Stations</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, {backgroundColor: 'orange'}]} />
-            <Text>Restaurants</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.legendDot, {backgroundColor: 'blue'}]} />
-            <Text>Rest Areas</Text>
+              
+              {/* Row with route button and toggle */}
+              <View style={styles.row}>
+                <TouchableOpacity 
+                  style={styles.button}
+                  onPress={getRoute}
+                >
+                  <Text style={styles.buttonText}>Get Route</Text>
+                </TouchableOpacity>
+                
+                <View style={styles.toggleContainer}>
+                  <Text style={styles.toggleLabel}>Rest Stops</Text>
+                  <TouchableOpacity 
+                    style={[
+                      styles.customToggle, 
+                      showRestStops ? styles.customToggleOn : styles.customToggleOff,
+                      routeCoords.length === 0 || isLoadingRestStops ? styles.customToggleDisabled : null
+                    ]}
+                    onPress={toggleRestStops}
+                    disabled={routeCoords.length === 0 || isLoadingRestStops}
+                  >
+                    <View style={[
+                      styles.customToggleBall,
+                      showRestStops ? styles.customToggleBallOn : styles.customToggleBallOff
+                    ]} />
+                  </TouchableOpacity>
+                  {isLoadingRestStops && (
+                    <ActivityIndicator size="small" color="#0000ff" style={styles.loading} />
+                  )}
+                </View>
+              </View>
+              
+              {/* Row with save button and view saved button */}
+              <View style={styles.row}>
+                <TouchableOpacity 
+                  style={[styles.button, styles.buttonSecondary]}
+                  onPress={saveRoute}
+                >
+                  <Text style={styles.buttonText}>Save Route</Text>
+                </TouchableOpacity>
+                
+                <TouchableOpacity 
+                  style={[styles.button, styles.buttonSecondary]}
+                  onPress={() => navigation.navigate('Routes')}
+                >
+                  <Text style={styles.buttonText}>View Saved Routes</Text>
+                </TouchableOpacity>
+              </View>
+              
+              {/* Legend row - only visible when rest stops are shown */}
+              {showRestStops && (
+                <View style={styles.legendContainer}>
+                  <Text style={styles.legendTitle}>Legend:</Text>
+                  <View style={styles.legendGrid}>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'blue'}]} />
+                      <Text style={styles.legendText}>Rest Areas</Text>
+                    </View>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'green'}]} />
+                      <Text style={styles.legendText}>Gas</Text>
+                    </View>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'orange'}]} />
+                      <Text style={styles.legendText}>Food</Text>
+                    </View>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'purple'}]} />
+                      <Text style={styles.legendText}>Lodging</Text>
+                    </View>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'yellow'}]} />
+                      <Text style={styles.legendText}>Stores</Text>
+                    </View>
+                    <View style={styles.legendItem}>
+                      <View style={[styles.legendDot, {backgroundColor: 'red'}]} />
+                      <Text style={styles.legendText}>Other</Text>
+                    </View>
+                  </View>
+                </View>
+              )}
+            </View>
           </View>
         </View>
-      )}
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
@@ -360,67 +618,183 @@ function MapScreen({ navigation, route, loadRoutes }) {
 const styles = StyleSheet.create({
   container: { 
     flex: 1, 
-    backgroundColor: '#f0f0f0' 
+    backgroundColor: '#f5f7fa'
   },
-  controls: { 
-    flexDirection: 'row', 
-    padding: 8, 
-    alignItems: 'center' 
+  keyboardAvoid: {
+    flex: 1
+  },
+  contentContainer: {
+    flex: 1,
+    display: 'flex'
+  },
+  mapContainer: {
+    // The map container has a fixed position
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 1
+  },
+  map: {
+    width: '100%',
+    // Height is set dynamically based on screen size
+  },
+  controlsContainer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    padding: 8,
+    zIndex: 2,
+    // Dynamically adjust 'top' based on map height
+    top: ({height}) => height * 0.6, // 60% of screen height for map
+  },
+  card: {
+    backgroundColor: 'white',
+    borderRadius: 10,
+    padding: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 2
+  },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8
   },
   input: {
     flex: 1,
+    backgroundColor: '#f5f7fa',
+    borderRadius: 6,
+    padding: 10,
+    marginHorizontal: 3,
+    fontSize: 14,
     borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    padding: 8,
-    marginRight: 8,
-    backgroundColor: '#fff'
+    borderColor: '#e1e5eb',
+    height: 38
   },
-  buttonRow: { 
-    flexDirection: 'row', 
-    justifyContent: 'space-around', 
-    padding: 8 
-  },
-  toggleContainer: {
-    flexDirection: 'row',
+  button: {
+    flex: 1,
+    backgroundColor: '#2196F3',
+    borderRadius: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 8
+    marginHorizontal: 3,
+    height: 36
+  },
+  buttonSecondary: {
+    backgroundColor: '#3a86ff',
+  },
+  buttonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 14
+  },
+  toggleContainer: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f5f7fa',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: '#e1e5eb',
+    marginHorizontal: 3,
+    height: 36
+  },
+  toggleLabel: {
+    fontSize: 14,
+    marginRight: 5,
+    flex: 1
   },
   loading: {
-    marginLeft: 8,
-    color: '#666'
+    marginLeft: 4
   },
   callout: {
-    width: 150,
-    padding: 5
+    width: 160,
+    padding: 8
   },
   calloutTitle: {
     fontWeight: 'bold',
-    marginBottom: 3
+    marginBottom: 3,
+    fontSize: 14
   },
-  legend: {
-    backgroundColor: 'rgba(255,255,255,0.9)',
-    padding: 8,
-    margin: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#ddd'
+  calloutType: {
+    fontSize: 12,
+    fontStyle: 'italic',
+    marginTop: 2,
+    color: '#666'
+  },
+  legendContainer: {
+    marginTop: 4,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#e1e5eb'
   },
   legendTitle: {
     fontWeight: 'bold',
-    marginBottom: 4
+    marginBottom: 6,
+    fontSize: 14
+  },
+  legendGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between'
   },
   legendItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginVertical: 2
+    width: '33%',
+    marginBottom: 6
   },
   legendDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    marginRight: 6
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    marginRight: 4,
+    borderWidth: 0.5,
+    borderColor: 'rgba(0,0,0,0.1)'
+  },
+  legendText: {
+    fontSize: 12
+  },
+  // Custom toggle styles
+  customToggle: {
+    width: 40,
+    height: 22,
+    borderRadius: 11,
+    padding: 2,
+    justifyContent: 'center'
+  },
+  customToggleOn: {
+    backgroundColor: '#4CD964'
+  },
+  customToggleOff: {
+    backgroundColor: '#D3D3D3'
+  },
+  customToggleDisabled: {
+    opacity: 0.4
+  },
+  customToggleBall: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: 'white',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1,
+    elevation: 1
+  },
+  customToggleBallOn: {
+    alignSelf: 'flex-end'
+  },
+  customToggleBallOff: {
+    alignSelf: 'flex-start'
   }
 });
 
