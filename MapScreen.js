@@ -10,7 +10,8 @@ import {
   useWindowDimensions,
   ActivityIndicator,
   KeyboardAvoidingView,
-  Platform
+  Platform,
+  Modal
 } from 'react-native';
 import MapView, { Marker, Polyline, Callout } from 'react-native-maps';
 import polyline from '@mapbox/polyline';
@@ -43,6 +44,8 @@ function MapScreen({ navigation, route, loadRoutes }) {
   const [isLoadingRestStops, setIsLoadingRestStops] = useState(false);
   const { width, height } = useWindowDimensions();
   const mapRef = useRef(null);
+  const [promptVisible, setPromptVisible] = useState(false);
+  const [routeName, setRouteName] = useState('');
   
   // Add refs to manage API requests and component mounting state
   const isMountedRef = useRef(true);
@@ -297,81 +300,83 @@ function MapScreen({ navigation, route, loadRoutes }) {
     }
   };
 
-  // Save route to AsyncStorage
-  const saveRoute = async () => {
-    if (!originQuery.trim() || !destinationQuery.trim() || !routeCoords.length) {
-      Alert.alert('Error', 'Please generate a route before saving.');
+ // Save route to AsyncStorage
+const saveRoute = async () => {
+  if (!originQuery.trim() || !destinationQuery.trim() || !routeCoords.length) {
+    Alert.alert('Error', 'Please generate a route before saving.');
+    return;
+  }
+  
+  // Show our custom prompt modal
+  setRouteName('');
+  setPromptVisible(true);
+};
+
+// Handle save after user enters name in our custom prompt
+const handleSaveWithName = async () => {
+  setPromptVisible(false);
+  
+  if (!routeName?.trim()) {
+    Alert.alert('Error', 'Route name cannot be empty.');
+    return;
+  }
+  
+  try {
+    console.log('Starting route save...');
+    
+    // Create new route object
+    const newRoute = {
+      name: routeName.trim(),
+      origin: originQuery,
+      destination: destinationQuery,
+      route: routeCoords
+    };
+    
+    // Get current routes
+    let routes = [];
+    const storedRoutes = await AsyncStorage.getItem(ROUTES_STORAGE_KEY);
+    console.log('Retrieved stored routes:', storedRoutes ? 'data found' : 'no data');
+    
+    if (storedRoutes) {
+      routes = JSON.parse(storedRoutes);
+    }
+    
+    // Check for duplicate names
+    const duplicateIndex = routes.findIndex(r => r.name === routeName.trim());
+    if (duplicateIndex >= 0) {
+      Alert.alert(
+        'Route name exists',
+        'A route with this name already exists. Would you like to overwrite it?',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { 
+            text: 'Overwrite', 
+            style: 'destructive', 
+            onPress: async () => {
+              routes[duplicateIndex] = newRoute;
+              await AsyncStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
+              Alert.alert('Success', 'Route updated!');
+              if (loadRoutes) loadRoutes();
+            }
+          }
+        ]
+      );
       return;
     }
     
-    Alert.prompt(
-      'Save Route',
-      'Enter a name for this route:',
-      async (name) => {
-        if (!name?.trim()) {
-          Alert.alert('Error', 'Route name cannot be empty.');
-          return;
-        }
-        
-        try {
-          console.log('Starting route save...');
-          
-          // Create new route object
-          const newRoute = {
-            name: name.trim(),
-            origin: originQuery,
-            destination: destinationQuery,
-            route: routeCoords
-          };
-          
-          // Get current routes
-          let routes = [];
-          const storedRoutes = await AsyncStorage.getItem(ROUTES_STORAGE_KEY);
-          console.log('Retrieved stored routes:', storedRoutes ? 'data found' : 'no data');
-          
-          if (storedRoutes) {
-            routes = JSON.parse(storedRoutes);
-          }
-          
-          // Check for duplicate names
-          const duplicateIndex = routes.findIndex(r => r.name === name.trim());
-          if (duplicateIndex >= 0) {
-            Alert.alert(
-              'Route name exists',
-              'A route with this name already exists. Would you like to overwrite it?',
-              [
-                { text: 'Cancel', style: 'cancel' },
-                { 
-                  text: 'Overwrite', 
-                  style: 'destructive', 
-                  onPress: async () => {
-                    routes[duplicateIndex] = newRoute;
-                    await AsyncStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
-                    Alert.alert('Success', 'Route updated!');
-                    if (loadRoutes) loadRoutes();
-                  }
-                }
-              ]
-            );
-            return;
-          }
-          
-          // Add new route
-          routes.push(newRoute);
-          console.log('Saving routes array with', routes.length, 'items');
-          
-          // Save to AsyncStorage
-          await AsyncStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
-          Alert.alert('Success', 'Route saved!');
-          if (loadRoutes) loadRoutes();
-        } catch (err) {
-          console.error('Save route error:', err);
-          Alert.alert('Error', 'Failed to save route: ' + err.message);
-        }
-      },
-      'plain-text'
-    );
-  };
+    // Add new route
+    routes.push(newRoute);
+    console.log('Saving routes array with', routes.length, 'items');
+    
+    // Save to AsyncStorage
+    await AsyncStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
+    Alert.alert('Success', 'Route saved!');
+    if (loadRoutes) loadRoutes();
+  } catch (err) {
+    console.error('Save route error:', err);
+    Alert.alert('Error', 'Failed to save route: ' + err.message);
+  }
+};
 
   // Improved marker color detection
   const getMarkerColor = (types = [], name = '') => {
@@ -451,6 +456,39 @@ function MapScreen({ navigation, route, loadRoutes }) {
 
   return (
     <SafeAreaView style={styles.container}>
+     {/* Custom prompt modal */}
+    <Modal
+      visible={promptVisible}
+      transparent={true}
+      animationType="fade"
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.promptContainer}>
+          <Text style={styles.promptTitle}>Save Route</Text>
+          <Text style={styles.promptMessage}>Enter a name for this route:</Text>
+          <TextInput
+            style={styles.promptInput}
+            value={routeName}
+            onChangeText={setRouteName}
+            autoFocus={true}
+          />
+          <View style={styles.promptButtons}>
+            <TouchableOpacity 
+              style={styles.promptButton} 
+              onPress={() => setPromptVisible(false)}
+            >
+              <Text style={styles.promptButtonText}>Cancel</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.promptButton, styles.promptButtonConfirm]} 
+              onPress={handleSaveWithName}
+            >
+              <Text style={[styles.promptButtonText, styles.promptButtonTextConfirm]}>Save</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal> 
       <KeyboardAvoidingView 
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         style={styles.keyboardAvoid}
@@ -795,7 +833,61 @@ const styles = StyleSheet.create({
   },
   customToggleBallOff: {
     alignSelf: 'flex-start'
-  }
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  promptContainer: {
+    width: '80%',
+    backgroundColor: 'white',
+    borderRadius: 10,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  promptTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 10,
+  },
+  promptMessage: {
+    fontSize: 16,
+    marginBottom: 15,
+  },
+  promptInput: {
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 5,
+    padding: 10,
+    fontSize: 16,
+    marginBottom: 15,
+  },
+  promptButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  promptButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginLeft: 10,
+  },
+  promptButtonConfirm: {
+    backgroundColor: '#2196F3',
+    borderRadius: 5,
+  },
+  promptButtonText: {
+    fontSize: 16,
+  },
+  promptButtonTextConfirm: {
+    color: 'white',
+  },
+  
 });
 
 export default MapScreen;
