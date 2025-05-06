@@ -70,13 +70,20 @@ function MapScreen({ navigation, route, loadRoutes }) {
       setOriginQuery(selected.origin);
       setDestinationQuery(selected.destination);
       setRouteCoords(selected.route || []);
-      
-      // Fit map to selected route coordinates
-      if (selected.route && selected.route.length > 0) {
-        mapRef.current?.fitToCoordinates(selected.route, {
-          edgePadding: { top: 50, bottom: 50, left: 50, right: 50 }
-        });
-      }
+     
+      // Add a slight delay to ensure route coordinates are set before fitting the map
+      setTimeout(() => {
+        // Fit map to selected route coordinates
+        if (selected.route && selected.route.length > 0 && mapRef.current) {
+          console.log('Fitting map to saved route coordinates');
+          mapRef.current.fitToCoordinates(selected.route, {
+            edgePadding: { top: 50, bottom: 50, left: 50, right: 50 },
+            animated: true
+          });
+        } else {
+          console.warn('Unable to fit map: missing ref or coordinates');
+        }
+      }, 300);
       
       // Clear params after processing
       navigation.setParams({ selectedRoute: undefined });
